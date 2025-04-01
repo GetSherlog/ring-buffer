@@ -4,7 +4,8 @@
 //! 1. Initializing the memory and persistent buffers
 //! 2. Configuring and starting the flush daemon
 //! 3. Writing logs from multiple threads concurrently
-//! 4. Reading logs back using a cursor
+//! 4. Using both direct write and reserve-commit patterns
+//! 5. Reading logs back using a cursor
 //! 
 //! The example creates both buffers, writes a large number of records from
 //! multiple threads with different tags, and then reads them back to verify
@@ -20,7 +21,9 @@ use sherlog_ring_buffer::{
     start_flush_daemon,
     stop_flush_daemon,
     write,
+    reserve,
     Cursor,
+    types::RecordHeader,
 };
 
 use std::sync::Arc;
@@ -32,10 +35,12 @@ use std::path::PathBuf;
 const TAG_INFO: u32 = 1;
 const TAG_WARNING: u32 = 2;
 const TAG_ERROR: u32 = 3;
+const TAG_DEBUG: u32 = 4;
 
 fn main() {
     // Initialize the buffers
-    let mem_buffer = init_memory_buffer(1024 * 1024); // 1MB memory buffer
+    // We specify the number of slots, not raw bytes
+    let mem_buffer = init_memory_buffer(4096); // 4096 slots (about 1MB with 256B slots)
     
     // Create a temporary file for the persistent buffer
     let disk_path = std::env::temp_dir().join("sherlog_example.dat");
@@ -43,7 +48,7 @@ fn main() {
     
     let disk_buffer = init_persistent_buffer(&disk_path, 10 * 1024 * 1024); // 10MB disk buffer
     
-    // Configure and start the flush daemon
+    // Configure and start the flush daemon with adaptive sizing
     let config = FlushDaemonConfig {
         interval_ms: 500, // Flush every 500ms
         high_watermark_percent: 50.0, // Or when buffer is 50% full
@@ -56,31 +61,57 @@ fn main() {
     let num_threads = 4;
     let logs_per_thread = 1000;
     
+    println!("Starting {} threads, each writing {} logs", num_threads, logs_per_thread);
+    println!("Each thread will use both direct write and reserve-commit patterns");
+    
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
             thread::spawn(move || {
                 for i in 0..logs_per_thread {
-                    let tag = match i % 3 {
-                        0 => TAG_INFO,
-                        1 => TAG_WARNING,
-                        _ => TAG_ERROR,
-                    };
-                    
-                    let message = format!("Thread {} - Log {} - Content: {} log message", 
-                                         thread_id, i, 
-                                         match tag {
-                                             TAG_INFO => "Info",
-                                             TAG_WARNING => "Warning",
-                                             _ => "Error",
-                                         });
-                    
-                    let success = write(message.into_bytes(), tag);
+                    // Alternate between direct write and reserve-commit pattern
+                    if i % 2 == 0 {
+                        // Direct write for even numbers
+                        let tag = match i % 3 {
+                            0 => TAG_INFO,
+                            1 => TAG_WARNING,
+                            _ => TAG_ERROR,
+                        };
+                        
+                        let message = format!("Thread {} - Direct Log {} - Content: {} log message", 
+                                           thread_id, i, 
+                                           match tag {
+                                               TAG_INFO => "Info",
+                                               TAG_WARNING => "Warning",
+                                               TAG_ERROR => "Error",
+                                               _ => "Unknown",
+                                           });
+                        
+                        write(message.into_bytes(), tag);
+                    } else {
+                        // Reserve-commit pattern for odd numbers
+                        let message = format!("Thread {} - Reserved Log {} - Debug data", thread_id, i);
+                        let data = message.into_bytes();
+                        
+                        // Try to reserve space (non-blocking)
+                        if let Some(mut reservation) = reserve(data.len(), false) {
+                            // Create and update the header
+                            let mut header = RecordHeader::new(data.len() as u32, TAG_DEBUG);
+                            header.update_crc(&data);
+                            
+                            // Write the data and commit
+                            reservation.write(header, &data);
+                            reservation.commit();
+                        }
+                        // If we couldn't reserve space, the record is dropped
+                    }
                     
                     // Sleep a bit to simulate real-world logging intervals
                     if i % 100 == 0 {
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
+                
+                println!("Thread {} completed", thread_id);
             })
         })
         .collect();
@@ -91,6 +122,7 @@ fn main() {
     }
     
     // Sleep a bit to allow the flush daemon to process
+    println!("All threads completed, waiting for flush daemon...");
     thread::sleep(Duration::from_millis(1000));
     
     // Stop the flush daemon
@@ -103,6 +135,7 @@ fn main() {
     
     // Cleanup - delete the temporary file
     std::fs::remove_file(&disk_path).ok();
+    println!("Example completed successfully");
 }
 
 fn read_logs(buffer: &Arc<sherlog_ring_buffer::PersistentRingBuffer>) {
@@ -114,6 +147,7 @@ fn read_logs(buffer: &Arc<sherlog_ring_buffer::PersistentRingBuffer>) {
     let mut info_count = 0;
     let mut warning_count = 0;
     let mut error_count = 0;
+    let mut debug_count = 0;
     
     while let Ok(batch) = cursor.read_batch(50) {
         if batch.is_empty() {
@@ -128,6 +162,7 @@ fn read_logs(buffer: &Arc<sherlog_ring_buffer::PersistentRingBuffer>) {
                 TAG_INFO => info_count += 1,
                 TAG_WARNING => warning_count += 1,
                 TAG_ERROR => error_count += 1,
+                TAG_DEBUG => debug_count += 1,
                 _ => {}
             }
         }
@@ -137,4 +172,5 @@ fn read_logs(buffer: &Arc<sherlog_ring_buffer::PersistentRingBuffer>) {
     println!("  - Info logs: {}", info_count);
     println!("  - Warning logs: {}", warning_count);
     println!("  - Error logs: {}", error_count);
+    println!("  - Debug logs: {}", debug_count);
 }

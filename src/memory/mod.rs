@@ -7,6 +7,7 @@
 //! - RecordHeader with timing, size, and integrity information
 //! - AtomicIndex for lock-free concurrent access
 //! - Cache-line padding to prevent false sharing
+//! - Sequence-based indices for precise tracking
 //! 
 //! The memory module implements data structures needed for both:
 //! - The volatile in-memory buffer (faster, but non-persistent)
@@ -90,7 +91,7 @@ impl Record {
     }
 }
 
-/// A multi-producer, single-consumer atomic index
+/// A multi-producer, single-consumer atomic index with sequence numbering
 pub(crate) struct AtomicIndex {
     /// The current index value, cache-line padded to avoid false sharing
     value: CachePadded<AtomicUsize>,
@@ -109,16 +110,19 @@ impl AtomicIndex {
     }
     
     /// Load the current index value with the specified ordering
+    #[inline]
     pub fn load(&self, ordering: Ordering) -> usize {
         self.value.load(ordering)
     }
     
     /// Store a new index value with the specified ordering
+    #[inline]
     pub fn store(&self, val: usize, ordering: Ordering) {
         self.value.store(val, ordering);
     }
     
     /// Compare and swap the index value
+    #[inline]
     pub fn compare_exchange(
         &self,
         current: usize,
@@ -129,15 +133,100 @@ impl AtomicIndex {
         self.value.compare_exchange(current, new, success, failure)
     }
     
-    /// Fetch and add to the index value, wrapping around capacity
+    /// Fetch and add to the index value
+    #[inline]
     pub fn fetch_add(&self, val: usize, ordering: Ordering) -> usize {
-        // Use the mask to wrap around capacity
-        let result = self.value.fetch_add(val, ordering);
-        result & self.mask
+        self.value.fetch_add(val, ordering)
     }
     
     /// Wrap a value to the capacity using the mask
+    #[inline]
     pub fn wrap(&self, val: usize) -> usize {
         val & self.mask
+    }
+    
+    /// Get the physical index in the buffer from a sequence number
+    #[inline]
+    pub fn physical_index(&self, seq: usize) -> usize {
+        seq & self.mask
+    }
+    
+    /// Get the capacity of this index
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
+    }
+}
+
+/// Slot state for buffer entries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum SlotState {
+    /// Slot is empty and available
+    Empty = 0,
+    /// Slot is reserved but not written yet
+    Reserved = 1,
+    /// Slot contains valid data
+    Ready = 2,
+    /// Slot has been read and can be recycled
+    Consumed = 3,
+}
+
+/// A slot in the buffer that can be atomically transitioned through states
+pub(crate) struct Slot {
+    /// Current state of the slot
+    pub state: std::sync::atomic::AtomicU8,
+    /// Sequence number for this slot
+    pub seq: AtomicUsize,
+}
+
+impl Slot {
+    /// Create a new empty slot
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(SlotState::Empty as u8),
+            seq: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Set the state of this slot
+    #[inline]
+    pub fn set_state(&self, state: SlotState, ordering: Ordering) {
+        self.state.store(state as u8, ordering);
+    }
+    
+    /// Get the current state
+    #[inline]
+    pub fn state(&self, ordering: Ordering) -> SlotState {
+        match self.state.load(ordering) {
+            0 => SlotState::Empty,
+            1 => SlotState::Reserved,
+            2 => SlotState::Ready,
+            3 => SlotState::Consumed,
+            _ => SlotState::Empty, // Default to empty for unknown values
+        }
+    }
+    
+    /// Try to transition from one state to another
+    #[inline]
+    pub fn try_transition(&self, from: SlotState, to: SlotState, ordering: Ordering) -> bool {
+        let from_val = from as u8;
+        let to_val = to as u8;
+        
+        self.state
+            .compare_exchange(from_val, to_val, ordering, Ordering::Relaxed)
+            .is_ok()
+    }
+    
+    /// Set the sequence number for this slot
+    #[inline]
+    pub fn set_seq(&self, seq: usize, ordering: Ordering) {
+        self.seq.store(seq, ordering);
+    }
+    
+    /// Get the sequence number for this slot
+    #[inline]
+    pub fn seq(&self, ordering: Ordering) -> usize {
+        self.seq.load(ordering)
     }
 }

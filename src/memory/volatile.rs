@@ -5,28 +5,30 @@
 //! 
 //! - Lock-free writes using atomic operations for multiple concurrent writers
 //! - Reserve-Write-Commit pattern to allow efficient, zero-copy writing
-//! - Overflow queue to handle buffer-full scenarios
+//! - Slot-based architecture for precise memory management
+//! - Sequence-based indices for better wrapping behavior
+//! - Overflow handling with bounded retries
 //! - Condition variable for consumer notification
 //! - Cache-line padding to prevent false sharing
 //! 
-//! The implementation uses a three-index approach:
-//! - `write_idx`: Where new writes are reserved
-//! - `commit_idx`: Which records are visible to consumers
-//! - `read_idx`: What has been consumed
-//! 
-//! When the buffer is full, records are placed in an overflow queue and
-//! written to the buffer as space becomes available.
+//! The implementation uses a sequence-based numbering approach with slots that
+//! transition through different states from empty to ready to consumed. This provides
+//! better memory ordering guarantees and clearer ownership semantics.
 
-use crate::memory::{AtomicIndex, Record, RecordHeader};
+use crate::memory::{AtomicIndex, Record, RecordHeader, Slot, SlotState};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use parking_lot::{Condvar, RwLock};
 use std::collections::VecDeque;
+use std::time::Duration;
+use crossbeam_utils::CachePadded;
 
 /// Lock-free reservation in the ring buffer
 pub struct Reservation {
-    /// Index where this reservation starts
-    start_idx: usize,
+    /// Slot index for this reservation
+    slot_idx: usize,
+    /// Sequence number for this reservation
+    seq: usize,
     /// Size of the reservation
     size: usize,
     /// Reference to the parent buffer
@@ -50,16 +52,18 @@ impl Reservation {
         assert!(data.len() <= self.size - RecordHeader::SIZE, 
                 "Data is larger than reservation");
                 
+        // Get a reference to the slot's data
+        let data_ptr = self.buffer.get_slot_data_ptr(self.slot_idx);
+                
         // Write the header
         unsafe {
-            let header_ptr = self.buffer.buffer.as_ptr().add(self.start_idx) as *mut RecordHeader;
+            let header_ptr = data_ptr as *mut RecordHeader;
             *header_ptr = header;
         }
         
         // Write the data
         unsafe {
-            let data_ptr = self.buffer.buffer.as_ptr()
-                .add(self.start_idx + RecordHeader::SIZE) as *mut u8;
+            let data_ptr = (data_ptr as *mut u8).add(RecordHeader::SIZE);
             std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
         }
     }
@@ -67,12 +71,19 @@ impl Reservation {
     /// Commit this reservation, making it visible to consumers
     pub fn commit(mut self) {
         if !self.committed {
-            // Update the commit index to make this record visible
-            self.buffer.advance_commit_index(self.start_idx, self.size);
-            self.committed = true;
+            // Mark the slot as ready
+            let slot = &self.buffer.slots[self.slot_idx];
             
-            // Notify any waiting consumers
-            self.buffer.notify_consumer();
+            // Transition from Reserved to Ready (this is atomic)
+            if slot.try_transition(SlotState::Reserved, SlotState::Ready, Ordering::Release) {
+                self.committed = true;
+                
+                // Update sequence to help downstream consumers
+                slot.set_seq(self.seq, Ordering::Release);
+                
+                // Notify any waiting consumers
+                self.buffer.notify_consumer();
+            }
         }
     }
 }
@@ -81,25 +92,28 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         // If dropping without committing, release the space
         if !self.committed {
-            // Optional: We could add a "cleanup" mechanism here to mark uncommitted
-            // reservations as free space, but for simplicity we'll leave this space
-            // as "dead" until it's naturally overwritten
+            let slot = &self.buffer.slots[self.slot_idx];
+            
+            // Try to transition back to Empty
+            slot.try_transition(SlotState::Reserved, SlotState::Empty, Ordering::Release);
         }
     }
 }
 
 /// Multi-producer, single-consumer ring buffer for volatile memory
 pub struct VolatileRingBuffer {
-    /// Raw buffer storage
-    buffer: Box<[u8]>,
-    /// Production write index
-    write_idx: AtomicIndex,
-    /// Consumption read index
-    read_idx: AtomicIndex,
-    /// Commit index - marking records as ready to be consumed
-    commit_idx: AtomicIndex,
+    /// Slots for data storage
+    slots: Box<[Slot]>,
+    /// Actual data storage
+    data: Box<[u8]>,
+    /// Production sequence (indicates next slot to produce)
+    prod_seq: CachePadded<AtomicIndex>,
+    /// Consumption sequence (indicates next slot to consume)
+    cons_seq: CachePadded<AtomicIndex>,
     /// Buffer capacity (power of 2)
     capacity: usize,
+    /// Size of each slot
+    slot_size: usize,
     /// Condition variable for notifying consumer about new data
     consumer_signal: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
     /// Lock for single-consumer reads
@@ -108,6 +122,8 @@ pub struct VolatileRingBuffer {
     overflow_queue: RwLock<VecDeque<Record>>,
     /// Maximum overflow queue size
     max_overflow: usize,
+    /// Maximum number of spins before fallback
+    max_spins: usize,
 }
 
 impl VolatileRingBuffer {
@@ -116,21 +132,33 @@ impl VolatileRingBuffer {
     /// Capacity is rounded up to the next power of 2
     pub fn new(capacity: usize) -> Self {
         // Round up to the next power of 2
-        let capacity = capacity.next_power_of_two();
+        let num_slots = capacity.next_power_of_two();
         
-        // Allocate buffer memory
-        let buffer = vec![0u8; capacity].into_boxed_slice();
+        // Default each slot to have 256 bytes
+        let slot_size = 256;
+        let total_data_size = num_slots * slot_size;
+        
+        // Allocate slots and data storage
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            slots.push(Slot::new());
+        }
+        
+        // Allocate data buffer
+        let data = vec![0u8; total_data_size].into_boxed_slice();
         
         Self {
-            buffer,
-            write_idx: AtomicIndex::new(capacity),
-            read_idx: AtomicIndex::new(capacity),
-            commit_idx: AtomicIndex::new(capacity),
-            capacity,
+            slots: slots.into_boxed_slice(),
+            data,
+            prod_seq: CachePadded::new(AtomicIndex::new(num_slots)),
+            cons_seq: CachePadded::new(AtomicIndex::new(num_slots)),
+            capacity: num_slots,
+            slot_size,
             consumer_signal: Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new())),
             consumer_lock: RwLock::new(()),
             overflow_queue: RwLock::new(VecDeque::new()),
             max_overflow: 1000, // Default max overflow records
+            max_spins: 100,     // Default max spins
         }
     }
     
@@ -147,54 +175,70 @@ impl VolatileRingBuffer {
     /// and `block` is false
     pub fn reserve(&self, size: usize, block: bool) -> Option<Reservation> {
         let total_size = size + RecordHeader::SIZE;
-        assert!(total_size <= self.capacity / 2, 
-                "Record too large for buffer - must be <= half capacity");
         
-        // Try to reserve space
-        loop {
-            let write = self.write_idx.load(Ordering::Relaxed);
-            let read = self.read_idx.load(Ordering::Acquire);
+        // Make sure the record fits in a slot
+        assert!(total_size <= self.slot_size, 
+                "Record too large for buffer slot - must be <= slot size");
+        
+        // Try to reserve space with bounded spins
+        let mut spins = 0;
+        while spins < self.max_spins {
+            // Get current production sequence
+            let prod_seq = self.prod_seq.load(Ordering::Relaxed);
             
-            // Calculate available space
-            let available = if write >= read {
-                self.capacity - (write - read)
-            } else {
-                read - write
-            };
+            // Calculate the physical slot index
+            let slot_idx = self.prod_seq.physical_index(prod_seq);
+            let slot = &self.slots[slot_idx];
             
-            // Check if we have enough space
-            if available <= total_size {
-                // Not enough space
-                if !block {
-                    return None;
+            // Check if this slot is available (Empty)
+            match slot.state(Ordering::Acquire) {
+                SlotState::Empty => {
+                    // Try to transition to Reserved
+                    if slot.try_transition(SlotState::Empty, SlotState::Reserved, Ordering::Acquire) {
+                        // Update production sequence
+                        let next_seq = prod_seq.wrapping_add(1);
+                        self.prod_seq.store(next_seq, Ordering::Release);
+                        
+                        // Set the sequence number in the slot
+                        slot.set_seq(prod_seq, Ordering::Release);
+                        
+                        // Return the reservation
+                        return Some(Reservation {
+                            slot_idx,
+                            seq: prod_seq,
+                            size: total_size,
+                            buffer: Arc::new(self.clone()),
+                            committed: false,
+                        });
+                    }
                 }
-                
-                // Wait for space to become available
-                std::thread::yield_now();
-                continue;
+                _ => {
+                    // Slot is not empty, try incremental backoff
+                    if spins < 10 {
+                        std::hint::spin_loop();
+                    } else if spins < 20 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(1));
+                    }
+                }
             }
             
-            // Try to reserve space by advancing write_idx
-            let new_write = self.write_idx.wrap(write + total_size);
-            match self.write_idx.compare_exchange(
-                write, new_write, 
-                Ordering::Release, Ordering::Relaxed
-            ) {
-                Ok(_) => {
-                    // Successfully reserved space
-                    return Some(Reservation {
-                        start_idx: write,
-                        size: total_size,
-                        buffer: Arc::new(self.clone()),
-                        committed: false,
-                    });
-                }
-                Err(_) => {
-                    // Another thread reserved space first, try again
-                    std::thread::yield_now();
-                    continue;
-                }
+            spins += 1;
+            
+            // If not blocking and we've already retried, give up
+            if !block && spins > 10 {
+                return None;
             }
+        }
+        
+        // All retries failed - either return None or wait and try again
+        if block {
+            // Sleep a bit then recurse
+            std::thread::sleep(Duration::from_millis(1));
+            self.reserve(size, block)
+        } else {
+            None
         }
     }
     
@@ -231,18 +275,10 @@ impl VolatileRingBuffer {
         }
     }
     
-    /// Advance the commit index to make a record visible to consumers
-    fn advance_commit_index(&self, start_idx: usize, size: usize) {
-        let mut current_commit = self.commit_idx.load(Ordering::Relaxed);
-        let new_commit = self.commit_idx.wrap(start_idx + size);
-        
-        // Keep trying until we successfully update the commit index
-        while let Err(actual) = self.commit_idx.compare_exchange(
-            current_commit, new_commit,
-            Ordering::Release, Ordering::Relaxed
-        ) {
-            current_commit = actual;
-        }
+    /// Get pointer to a slot's data
+    fn get_slot_data_ptr(&self, slot_idx: usize) -> *mut u8 {
+        let offset = slot_idx * self.slot_size;
+        unsafe { self.data.as_ptr().add(offset) as *mut u8 }
     }
     
     /// Notify the consumer that new data is available
@@ -270,7 +306,7 @@ impl VolatileRingBuffer {
         match timeout_ms {
             Some(timeout) => {
                 // parking_lot's wait_for returns true if notified, false if timed out
-                let was_notified = !cvar.wait_for(&mut ready, std::time::Duration::from_millis(timeout)).timed_out();
+                let was_notified = !cvar.wait_for(&mut ready, Duration::from_millis(timeout)).timed_out();
                 *ready = false;
                 was_notified
             }
@@ -293,50 +329,66 @@ impl VolatileRingBuffer {
         
         let mut records = Vec::new();
         
-        // Get the current read and commit indices
-        let read = self.read_idx.load(Ordering::Relaxed);
-        let commit = self.commit_idx.load(Ordering::Acquire);
+        // Get current consumer sequence
+        let mut cons_seq = self.cons_seq.load(Ordering::Relaxed);
         
-        // No data to read
-        if read == commit {
-            return records;
-        }
+        // Process ready slots
+        let mut processed = 0;
         
-        let mut current_read = read;
+        // To prevent infinite loops, limit the number of slots we'll check
+        let max_slots_to_check = self.capacity;
         
-        // Read committed records
-        while current_read != commit {
-            // Read the record header
-            let header = unsafe {
-                *(self.buffer.as_ptr().add(current_read) as *const RecordHeader)
-            };
+        for _ in 0..max_slots_to_check {
+            // Get the physical slot index
+            let slot_idx = self.cons_seq.physical_index(cons_seq);
+            let slot = &self.slots[slot_idx];
             
-            // Read the record data
-            let data_size = header.size as usize;
-            let mut data = vec![0u8; data_size];
-            
-            unsafe {
-                let data_ptr = self.buffer.as_ptr().add(current_read + RecordHeader::SIZE);
-                std::ptr::copy_nonoverlapping(data_ptr, data.as_mut_ptr(), data_size);
-            }
-            
-            // Verify CRC
-            if header.verify_crc(&data) {
-                records.push(Record { header, data });
+            // Check if the slot is ready to read
+            if slot.state(Ordering::Acquire) == SlotState::Ready && slot.seq(Ordering::Acquire) == cons_seq {
+                // Read the record header
+                let data_ptr = self.get_slot_data_ptr(slot_idx);
+                let header = unsafe {
+                    *(data_ptr as *const RecordHeader)
+                };
+                
+                // Read the record data
+                let data_size = header.size as usize;
+                let mut data = vec![0u8; data_size];
+                
+                unsafe {
+                    let src_ptr = data_ptr.add(RecordHeader::SIZE);
+                    std::ptr::copy_nonoverlapping(src_ptr, data.as_mut_ptr(), data_size);
+                }
+                
+                // Verify CRC
+                if header.verify_crc(&data) {
+                    records.push(Record { header, data });
+                }
+                
+                // Mark slot as consumed
+                slot.set_state(SlotState::Consumed, Ordering::Release);
+                
+                // Advance consumer sequence
+                cons_seq = cons_seq.wrapping_add(1);
+                processed += 1;
+                
+                // Recycle the slot by marking it empty
+                // Note: For MPSC, we can safely recycle right away
+                slot.set_state(SlotState::Empty, Ordering::Release);
+                
             } else {
-                // CRC mismatch, record might be corrupted
-                // In production, we might want to log this error
+                // No more ready records
+                break;
             }
-            
-            // Advance read pointer
-            current_read = self.read_idx.wrap(current_read + RecordHeader::SIZE + data_size);
         }
         
-        // Update the read index
-        self.read_idx.store(current_read, Ordering::Release);
+        // Update consumer sequence if we processed any records
+        if processed > 0 {
+            self.cons_seq.store(cons_seq, Ordering::Release);
+        }
         
         // Process any overflow queue entries now that we have space
-        {
+        if processed > 0 {
             let mut queue = self.overflow_queue.write();
             while let Some(record) = queue.pop_front() {
                 if let Some(mut reservation) = self.reserve(record.data.len(), false) {
@@ -355,37 +407,55 @@ impl VolatileRingBuffer {
     
     /// Get the current buffer usage as a percentage
     pub fn usage_percent(&self) -> f32 {
-        let write = self.write_idx.load(Ordering::Relaxed);
-        let read = self.read_idx.load(Ordering::Relaxed);
+        let prod_seq = self.prod_seq.load(Ordering::Relaxed);
+        let cons_seq = self.cons_seq.load(Ordering::Relaxed);
         
-        let used = if write >= read {
-            write - read
-        } else {
-            self.capacity - read + write
-        };
+        // Calculate how many slots are in use (this works even with wrapping)
+        let used = (prod_seq.wrapping_sub(cons_seq)) as f32;
+        let capacity = self.capacity as f32;
         
-        (used as f32 / self.capacity as f32) * 100.0
+        (used / capacity) * 100.0
     }
     
-    /// Get the current buffer capacity
+    /// Get the current buffer capacity in slots
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+    
+    /// Get the size of each slot in bytes
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
 }
 
-// Implement Clone manually to avoid cloning the buffer
 impl Clone for VolatileRingBuffer {
     fn clone(&self) -> Self {
+        // Create a new empty buffer with the same capacity and slot size
+        let slot_size = self.slot_size;
+        let num_slots = self.capacity;
+        let total_data_size = num_slots * slot_size;
+        
+        // Allocate slots and data storage
+        let mut slots = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            slots.push(Slot::new());
+        }
+        
+        // Allocate data buffer
+        let data = vec![0u8; total_data_size].into_boxed_slice();
+        
         Self {
-            buffer: vec![0u8; self.capacity].into_boxed_slice(),
-            write_idx: AtomicIndex::new(self.capacity),
-            read_idx: AtomicIndex::new(self.capacity),
-            commit_idx: AtomicIndex::new(self.capacity),
+            slots: slots.into_boxed_slice(),
+            data,
+            prod_seq: CachePadded::new(AtomicIndex::new(num_slots)),
+            cons_seq: CachePadded::new(AtomicIndex::new(num_slots)),
             capacity: self.capacity,
+            slot_size: self.slot_size,
             consumer_signal: self.consumer_signal.clone(),
             consumer_lock: RwLock::new(()),
             overflow_queue: RwLock::new(VecDeque::new()),
             max_overflow: self.max_overflow,
+            max_spins: self.max_spins,
         }
     }
 }
@@ -490,7 +560,7 @@ mod tests {
     #[test]
     fn test_buffer_overflow() {
         // Small buffer that can hold only a few records
-        let buffer = VolatileRingBuffer::new(64);
+        let buffer = VolatileRingBuffer::new(4);
         
         // Fill the buffer
         for i in 0..20 {
@@ -516,5 +586,31 @@ mod tests {
         
         let records = buffer.read();
         assert_eq!(records.len(), 5);
+    }
+    
+    #[test]
+    fn test_sequence_wrapping() {
+        // Test that sequence numbers wrap around correctly
+        let buffer = VolatileRingBuffer::new(4); // Small buffer to force wrapping
+        
+        // Write enough records to wrap around the sequence space multiple times
+        for i in 0..20 {
+            let data = format!("wrap {}", i).into_bytes();
+            let record = Record::new(data, i);
+            buffer.write(record);
+            
+            // Read after each write to keep the buffer from filling up
+            buffer.read();
+        }
+        
+        // Verify the buffer is still working
+        let data = b"final test".to_vec();
+        let record = Record::new(data, 999);
+        assert!(buffer.write(record));
+        
+        let records = buffer.read();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, b"final test");
+        assert_eq!(records[0].header.tag, 999);
     }
 }

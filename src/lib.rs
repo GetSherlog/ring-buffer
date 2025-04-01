@@ -63,7 +63,7 @@ static FLUSH_DAEMON_RUNNING: AtomicBool = AtomicBool::new(false);
 /// 
 /// # Arguments
 ///
-/// * `capacity` - Size of the buffer in bytes
+/// * `capacity` - Number of slots in the buffer (rounded up to power of 2)
 pub fn init_memory_buffer(capacity: usize) -> Arc<VolatileRingBuffer> {
     let buffer = Arc::new(VolatileRingBuffer::new(capacity));
     
@@ -87,7 +87,7 @@ pub fn init_persistent_buffer<P: AsRef<Path>>(path: P, size: usize) -> Arc<Persi
         Ok(buffer) => {
             let buffer_arc = Arc::new(buffer);
             
-            // We cannot replace the Lazy directly, so we'll use this buffer for all
+            // We cannot replace the OnceCell directly, so we'll use this buffer for all
             // subsequent calls to get_persistent_buffer
             PERSISTENT_BUFFER.get_or_init(|| buffer_arc.clone());
             
@@ -102,8 +102,8 @@ pub fn init_persistent_buffer<P: AsRef<Path>>(path: P, size: usize) -> Arc<Persi
 /// Get a reference to the global volatile ring buffer
 pub fn get_memory_buffer() -> Arc<VolatileRingBuffer> {
     VOLATILE_BUFFER.get_or_init(|| {
-        // Default 1MB buffer size for in-memory logs
-        Arc::new(VolatileRingBuffer::new(1024 * 1024))
+        // Default 4096 slots (with 256 bytes each = ~1MB)
+        Arc::new(VolatileRingBuffer::new(4096))
     }).clone()
 }
 
@@ -158,9 +158,28 @@ pub fn start_flush_daemon(config: FlushDaemonConfig) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("sherlog-flush-daemon".to_string())
         .spawn(move || {
+            let mut batch_size = config.max_records_per_flush;
+            
             while FLUSH_DAEMON_RUNNING.load(Ordering::SeqCst) {
                 // Check if buffer usage is above high watermark
                 let usage = memory_buffer.usage_percent();
+                
+                // Adjust batch size based on buffer usage for adaptive flushing
+                if usage > config.high_watermark_percent {
+                    // If usage is high, increase batch size to flush more aggressively
+                    batch_size = (config.max_records_per_flush as f32 * 1.5) as usize;
+                } else if usage < config.high_watermark_percent / 2.0 {
+                    // If usage is low, decrease batch size to reduce I/O overhead
+                    batch_size = config.max_records_per_flush / 2;
+                } else {
+                    // Otherwise use the configured batch size
+                    batch_size = config.max_records_per_flush;
+                }
+                
+                // Ensure batch size is at least 1
+                batch_size = batch_size.max(1);
+                
+                // Determine if we should flush
                 let should_flush = usage >= config.high_watermark_percent || 
                                    memory_buffer.wait_for_data(Some(config.interval_ms));
                 
@@ -169,18 +188,29 @@ pub fn start_flush_daemon(config: FlushDaemonConfig) -> thread::JoinHandle<()> {
                     let records = memory_buffer.read();
                     
                     if !records.is_empty() {
+                        // Track successful writes
+                        let mut success_count = 0;
+                        
                         // Write to persistent storage
-                        for record in records.iter().take(config.max_records_per_flush) {
-                            if let Err(e) = disk_buffer.write(record) {
-                                // In production, we might want to handle this error differently
-                                eprintln!("Error writing to persistent buffer: {:?}", e);
-                                break;
+                        for record in records.iter().take(batch_size) {
+                            match disk_buffer.write(record) {
+                                Ok(_) => {
+                                    success_count += 1;
+                                },
+                                Err(e) => {
+                                    // In production, we might want to handle this error differently
+                                    eprintln!("Error writing to persistent buffer: {:?}", e);
+                                    // Break on first error to prevent further damage
+                                    break;
+                                }
                             }
                         }
                         
-                        // Ensure data is flushed to disk
-                        if let Err(e) = disk_buffer.flush() {
-                            eprintln!("Error flushing persistent buffer: {:?}", e);
+                        // Only flush if we had successful writes
+                        if success_count > 0 {
+                            if let Err(e) = disk_buffer.flush() {
+                                eprintln!("Error flushing persistent buffer: {:?}", e);
+                            }
                         }
                     }
                 } else {
@@ -203,6 +233,10 @@ pub fn stop_flush_daemon() {
 ///
 /// * `data` - Data to write
 /// * `tag` - Tag for filtering or identifying record type
+///
+/// # Returns
+///
+/// `true` if written directly to buffer, `false` if added to overflow queue
 pub fn write(data: Vec<u8>, tag: u32) -> bool {
     let record = memory::Record::new(data, tag);
     get_memory_buffer().write(record)
@@ -220,7 +254,12 @@ pub fn write(data: Vec<u8>, tag: u32) -> bool {
 /// Some(Reservation) if space was successfully reserved, None if the buffer is full
 /// and `block` is false
 pub fn reserve(size: usize, block: bool) -> Option<memory::volatile::Reservation> {
-    get_memory_buffer().reserve(size, block)
+    // Verify size does not exceed slot capacity
+    let buffer = get_memory_buffer();
+    assert!(size <= buffer.slot_size() - memory::RecordHeader::SIZE, 
+        "Data size exceeds maximum slot capacity");
+    
+    buffer.reserve(size, block)
 }
 
 /// Re-exported data types used in the API

@@ -4,7 +4,7 @@ A high-performance, lock-free ring buffer implementation for mobile app logging 
 
 - **Multi-Producer, Single-Consumer (MPSC)** in-memory volatile buffer
 - **Single-Producer, Single-Consumer (SPSC)** persistent disk buffer
-- Auto-flushing daemon to move data from memory to disk
+- Auto-flushing daemon with adaptive batch sizing
 - Cursor-based consumption for reading from persistent storage
 - Native integration for both **Android (JNI)** and **iOS (Swift)**
 
@@ -12,17 +12,19 @@ A high-performance, lock-free ring buffer implementation for mobile app logging 
 
 Sherlog Ring Buffer is a specialized logging subsystem designed for high-performance mobile applications on both Android and iOS. It provides a two-stage buffering system:
 
-1. An in-memory ring buffer for extremely fast, lock-free writes from multiple threads
+1. An in-memory slot-based ring buffer for extremely fast, lock-free writes from multiple threads
 2. A persistent, memory-mapped ring buffer for durable storage on disk
 
-A background flush daemon automatically transfers records from memory to disk based on configurable watermarks and intervals. The design enables applications to generate logs at high throughput while minimizing I/O overhead and ensuring data durability.
+A background flush daemon automatically transfers records from memory to disk based on configurable watermarks and intervals, with adaptive batch sizing based on buffer usage. The design enables applications to generate logs at high throughput while minimizing I/O overhead and ensuring data durability.
 
 ## Features
 
 - **Concurrent Writes**: Multiple threads can safely write logs without locks
+- **Slot-Based Architecture**: Efficient memory management with fixed-size slots
+- **Sequence-Based Indexing**: Precise tracking of buffer positions
 - **Memory-Mapped Persistence**: Fast disk I/O using memory mapping
 - **Data Integrity**: CRC32 checksums and record markers to detect corruption
-- **Reserve-Write-Commit Pattern**: Efficient memory management with zero-copy design
+- **Reserve-Write-Commit Pattern**: Zero-copy design with explicit memory ownership
 - **Overflow Protection**: Secondary queue for handling buffer-full scenarios
 - **Partial Reads**: Cursor-based design for consuming arbitrary batches of records
 
@@ -30,9 +32,9 @@ A background flush daemon automatically transfers records from memory to disk ba
 
 The system consists of several core components:
 
-1. **Volatile Ring Buffer**: In-memory MPSC buffer with atomic indices
+1. **Volatile Ring Buffer**: In-memory MPSC buffer with sequence-based atomic indices and slot states
 2. **Persistent Ring Buffer**: Disk-backed SPSC buffer with memory mapping
-3. **Flush Daemon**: Background thread moving data from memory to disk
+3. **Flush Daemon**: Background thread moving data from memory to disk with adaptive batch sizing
 4. **Cursor**: Stateful reader for consuming records from persistent storage
 5. **Platform Bindings**: Native interfaces for Android (JNI) and iOS (Swift)
 
@@ -72,35 +74,58 @@ use sherlog_ring_buffer::{
     FlushDaemonConfig,
     start_flush_daemon,
     write,
+    reserve,
     Cursor,
+    types::RecordHeader,
 };
 
 fn main() {
     // Initialize buffers
-    init_memory_buffer(1024 * 1024); // 1MB volatile buffer
+    // We specify the number of slots, not raw bytes
+    init_memory_buffer(4096); // 4096 slots (about 1MB with 256B slots)
     init_persistent_buffer("/path/to/logs.dat", 10 * 1024 * 1024); // 10MB persistent buffer
     
-    // Start the flush daemon
-    let daemon = start_flush_daemon(FlushDaemonConfig::default());
+    // Start the flush daemon with adaptive batch sizing
+    let config = FlushDaemonConfig {
+        interval_ms: 500,               // Flush every 500ms
+        high_watermark_percent: 50.0,   // Or when buffer is 50% full
+        max_records_per_flush: 100,     // Start with batches of 100 records
+    };
+    let daemon = start_flush_daemon(config);
     
     // Write logs from multiple threads
     write("Log message".as_bytes().to_vec(), 1); // Tag 1 for info logs
     
-    // Use reservation pattern for larger messages
-    if let Some(mut reservation) = sherlog_ring_buffer::reserve(100, false) {
+    // Use reservation pattern for zero-copy writing
+    if let Some(mut reservation) = reserve(100, false) {
         let data = "A longer message with more details".as_bytes();
-        let mut header = sherlog_ring_buffer::types::RecordHeader::new(data.len() as u32, 2);
+        let mut header = RecordHeader::new(data.len() as u32, 2);
         header.update_crc(data);
         reservation.write(header, data);
+        
+        // Must explicitly commit for the record to be visible
         reservation.commit();
+    }
+    
+    // Alternatively, use blocking reservation when needed
+    if let Some(mut reservation) = reserve(100, true) { // Will block until space is available
+        // Similar to above, but will wait instead of failing when buffer is full
+        // [...]
     }
     
     // Read logs with a cursor
     let buffer = sherlog_ring_buffer::get_persistent_buffer();
     let mut cursor = Cursor::new(buffer.clone(), None);
     
+    // Read individual records
     while let Ok(Some(record)) = cursor.next() {
-        println!("Log: {:?}", std::str::from_utf8(&record.data).unwrap());
+        println!("Log: {}", std::str::from_utf8(&record.data).unwrap());
+    }
+    
+    // Or read in efficient batches
+    let batch = cursor.read_batch(50).unwrap();
+    for record in batch {
+        println!("Batch Log: {}", std::str::from_utf8(&record.data).unwrap());
     }
 }
 ```
@@ -483,11 +508,14 @@ class Logger {
 
 ## Performance Considerations
 
-- Buffer sizes should be powers of 2 for optimal performance
-- The volatile buffer uses lock-free algorithms for high throughput
-- Records larger than half the buffer size cannot be written
-- Consider proper sizing based on log volume and flush frequency
-- Memory mapped I/O provides good performance but has filesystem limitations
+- Slot-based architecture improves memory locality and reduces contention
+- Sequence-based indices prevent the ABA problem in concurrent access
+- Each slot has a fixed size (default 256 bytes), so consider record sizes
+- Buffer capacity is measured in number of slots, not raw bytes
+- Exponential backoff reduces contention during high load
+- Thread-local operations minimize cross-core synchronization
+- Memory mapped I/O provides good persistent storage performance
+- Adaptive flush batch sizing optimizes I/O based on buffer pressure
 
 ## Advanced Usage
 
