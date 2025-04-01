@@ -40,3 +40,7 @@ ios = ["swift-bridge"]
 lto = true
 codegen-units = 1
 opt-level = 3
+
+[dev-dependencies]
+# Testing utilities
+tempfile = "3.7"
