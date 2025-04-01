@@ -52,6 +52,15 @@ Sherlog Ring Buffer supports both Android and iOS platforms:
 - **Android**: Using JNI bindings 
 - **iOS**: Using Swift bindings
 
+## Documentation
+
+This project includes several documents to help you get started and make the most of Sherlog Ring Buffer:
+
+- [**DEVELOPMENT.md**](DEVELOPMENT.md): Detailed guide for setting up development environments for Android and iOS
+- [**iOS Demo App**](examples/ios-demo/README.md): Comprehensive demo showcasing all features on iOS
+  - [Build Instructions](examples/ios-demo/BUILD_INSTRUCTIONS.md): Step-by-step guide to build and run the iOS demo
+- [**API Documentation**](#basic-usage): Usage examples and API reference
+
 For detailed integration and building instructions, see the [DEVELOPMENT.md](DEVELOPMENT.md) guide.
 
 ## Basic Usage
@@ -565,3 +574,9 @@ pub fn log_compressed(message: &str, level: u32) {
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Community and Support
+
+- **GitHub Issues**: For bug reports and feature requests, please [create an issue](https://github.com/your-username/sherlog-ring-buffer/issues)
+- **Documentation**: Check the [documentation](#documentation) for detailed guides
+- **Examples**: Browse the [examples directory](examples/) for more usage examples
